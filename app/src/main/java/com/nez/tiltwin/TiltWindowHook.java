@@ -21,7 +21,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Batasan: matrix SurfaceControl cuma 2D, jadi ini skew (pseudo-3D), bukan rotasi 3D asli.
  *
  * Daftarkan di assets/xposed_init:  com.nez.tiltwin.TiltWindowHook
- * Scope LSPosed: XOS Launcher (com.transsion.XOSLauncher)
+ * Scope LSPosed: XOS Launcher (com.transsion.launcher3)
  */
 public class TiltWindowHook implements IXposedHookLoadPackage {
 
@@ -33,7 +33,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
-        if (!lpp.packageName.equals("com.transsion.XOSLauncher")
+        XposedBridge.log(TAG + "loaded in " + lpp.packageName);
+        if (!lpp.packageName.equals("com.transsion.launcher3")
                 && !lpp.packageName.equals("com.android.launcher3")) return;
 
         try {
