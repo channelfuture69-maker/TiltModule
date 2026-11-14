@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Tilt Animation</string>
+    <string name="module_desc">Animasi buka/tutup aplikasi miring (tilt) seperti iOS untuk XOS Launcher</string>
+</resources>
