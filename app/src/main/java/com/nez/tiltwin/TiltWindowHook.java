@@ -63,14 +63,16 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     // ===== Perspektif 3D (trapesium) =====
     private static final boolean PERSPECTIVE = true;   // false = selalu pakai tilt 2D
-    private static final float RX_BASE   = 14f;   // atas menyempit/melebar (balik tanda kalau kebalik)
+    private static final float RX_BASE   = 20f;   // atas menyempit/melebar (balik tanda kalau kebalik)
     private static final float RX_BY_Y   = 4f;    // ikon bawah lebih miring, atas lebih landai
     private static final float RY_BY_X   = -12f;  // miring kiri-kanan menurut posisi ikon
     private static final float RY_CENTER = 0f;
-    private static final float CAMERA_DIST = 2500f; // makin kecil = perspektif makin kuat
-    private static final float CORNER_LOCAL = 90f;      // radius sudut jendela (px, ikut mengecil bersama jendela)
-    private static final float WIN_ALPHA_MIN = 0.2f;    // jendela hampir transparan saat seukuran ikon (crossfade dengan ikon)
-    private static final float WIN_FADE_IN = 0.2f;      // jendela penuh opak setelah progres ini
+    private static final float CAMERA_DIST = 1300f; // makin kecil = perspektif makin kuat
+    private static final float CORNER_SMALL = 90f;      // radius sudut saat kecil (px lokal)
+    private static final float CORNER_FULL  = 58f;      // radius sudut saat hampir full (samakan dgn sudut layar)
+    private static final float CORNER_LOCAL_UNUSED = 0f;      // radius sudut jendela (px, ikut mengecil bersama jendela)
+    private static final float WIN_ALPHA_MIN = 0.15f;   // jendela hampir transparan saat seukuran ikon (crossfade dengan ikon)
+    private static final float WIN_FADE_IN = 0.12f;     // jendela penuh opak setelah progres ini
 
     // ===== Saat animasi dipotong =====
     private static final boolean SMOOTH_INTERRUPT = true;  // false = matikan semua penanganan potong
@@ -93,7 +95,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private int offL, offT, offR, offB;
 
     // state animasi
-    private boolean lastValid, hasOffset;
+    private boolean lastValid, hasOffset, holdFull;
     private long lastMs = 0, t0 = 0;
     private float prevTsx, prevTsy, prevTtx, prevTty;
     private float prevDsx, prevDsy, prevDtx, prevDty, prevDprog;
@@ -115,6 +117,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     // perspektif
     private Bitmap snap;
+    private float cornerPx = CORNER_SMALL;
     private boolean snapRetaken, animOpening, perspOff, toastShown;
     private int perspFails = 0;
     private String lastCaptureErr = "?";
@@ -267,7 +270,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
         if (fullTarget) {
             // animasi baru yang mulai dari full screen (mis. tutup app) tepat setelah animasi dipotong
-            boolean keep = SMOOTH_INTERRUPT && cont && (remap || prevDsx < 0.97f || !isSettled(now));
+            boolean naturalEnd = !remap && prevDprog >= 0.75f;   // buka hampir selesai -> frame full = akhir animasi
+            boolean keep = SMOOTH_INTERRUPT && cont && !naturalEnd && (remap || prevDsx < 0.97f || !isSettled(now));
             if (!keep) { resetState(); return; }
         }
         if (sx <= MIN_SCALE || sy <= MIN_SCALE) return;
@@ -337,6 +341,10 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             remapCrop = null;
             tableClear();
         }
+
+        // animasi tutup yang dimulai dari full screen setelah dipotong: beberapa frame awal masih full
+        if (fullTarget && jumped) holdFull = true;
+        else if (!fullTarget) holdFull = false;
 
         // ---- geometri yang ditampilkan ----
         float dsx = sx, dsy = sy, dtx = tx, dty = ty;
@@ -412,6 +420,11 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
         // ---- mode perspektif 3D: snapshot + overlay ----
         if (PERSPECTIVE && !perspOff) {
+            if (fullTarget && !jumped && !holdFull && !(remap && remapClosing)) {
+                // akhir animasi buka: jendela asli harus kelihatan lagi, overlay dibuang
+                resetState();
+                return;
+            }
             final Activity actP = launcherRef.get();
             if (actP != null) {
                 boolean newAnimFrame = !cont || (jumped && !remap);
@@ -441,7 +454,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                     final float fcx = cx, fcy = cy;
                     final int iw = (int) w, ih = (int) h;
                     final float dens = dm.density;
-                    runMain(() -> updateOverlay(actP, sb, iw, ih, fcx, fcy, fS, fA, rx, ry, dens));
+                    final float fFull = progress;
+                    runMain(() -> updateOverlay(actP, sb, iw, ih, fcx, fcy, fS, fA, fFull, rx, ry, dens));
                     if (overlayReady) {
                         Matrix off = new Matrix();
                         off.setTranslate(-10000f, -10000f);   // jendela asli disembunyikan
@@ -549,6 +563,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     private void resetState() {
         lastValid = false;
+        holdFull = false;
         lastMs = 0;
         hasOffset = false;
         hasCropOffset = false;
@@ -607,7 +622,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     }
 
     private void updateOverlay(Activity act, Bitmap b, int w, int h, float cx, float cy,
-                               float scale, float alpha, float rx, float ry, float density) {
+                               float scale, float alpha, float full, float rx, float ry, float density) {
         try {
             if (overlay == null) {
                 ImageView iv = new ImageView(act);
@@ -616,7 +631,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 iv.setOutlineProvider(new ViewOutlineProvider() {
                     @Override
                     public void getOutline(View view, Outline o) {
-                        o.setRoundRect(0, 0, view.getWidth(), view.getHeight(), CORNER_LOCAL);
+                        o.setRoundRect(0, 0, view.getWidth(), view.getHeight(), cornerPx);
                     }
                 });
                 iv.setCameraDistance(CAMERA_DIST * density);
@@ -637,6 +652,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             overlay.setAlpha(alpha);
             overlay.setRotationX(rx);
             overlay.setRotationY(ry);
+            cornerPx = CORNER_SMALL + (CORNER_FULL - CORNER_SMALL) * smoothstep(full);
+            overlay.invalidateOutline();
             overlayReady = true;
 
             main().removeCallbacks(overlayRemoveRun);
