@@ -12,6 +12,7 @@ import android.util.Pair;
 import android.view.View;
 
 import java.lang.ref.WeakReference;
+import java.util.Arrays;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -21,11 +22,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
  * Animasi buka/tutup app ala iOS: tilt jendela mengikuti posisi ikon + home zoom/fade,
- * semua dari satu sumber progres (sinkron), dan INTERRUPTIBLE:
- * kalau animasi dipotong di tengah jalan (buka lalu langsung tutup, atau pindah ke app lain),
- * tampilan tidak lompat. Selisih antara posisi yang sedang tampil dan posisi awal animasi
- * berikutnya disimpan sebagai "offset", lalu diredam mulus (critically damped, tanpa memantul)
- * sampai animasi baru benar-benar menggantikan.
+ * semua dari satu sumber progres (sinkron).
+ *
+ * Saat animasi dipotong (mis. setengah buka lalu langsung tutup, atau sebaliknya):
+ *  - Jalur gerak jendela (scale, posisi, crop per progres) direkam dari animasi yang sedang jalan.
+ *  - Animasi baru memutar balik MENYUSURI jalur yang sama mulai dari posisi sekarang,
+ *    jadi gerakan, tilt, dan animasi ikon-nya identik dengan animasi normal, tanpa lompat.
+ *  - Kalau tidak bisa dibalik (mis. ikon lain), dipakai peralihan mulus (offset teredam).
  *
  * Batasan: matrix SurfaceControl cuma 2D, jadi tilt jendela = rotasi + skew, bukan perspektif 3D asli.
  */
@@ -47,13 +50,14 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private static final boolean ICON_ANIM = true;
     private static final float ICON_ZOOM   = 0.14f;
     private static final float FADE_END    = 0.55f;
-    private static final long  RESTORE_MS  = 300L;  // harus > jeda antar animasi saat buka-tutup cepat
+    private static final long  RESTORE_MS  = 300L;
 
-    // ===== Peralihan mulus saat animasi dipotong =====
-    private static final boolean SMOOTH_INTERRUPT = true; // false = matikan kalau malah glitch
-    private static final float SETTLE_RATE = 14f;   // makin besar = peredaman lebih cepat (0.3 dtk ~ 90% selesai)
-    private static final long  GRACE_MS    = 400L;  // jarak maksimal antar animasi yang dianggap "sambungan"
-    private static final long  JUMP_GAP_MS = 60L;   // jeda frame segini = dianggap animasi baru
+    // ===== Saat animasi dipotong =====
+    private static final boolean SMOOTH_INTERRUPT = true;  // false = matikan semua penanganan potong
+    private static final boolean REVERSE_MODE     = true;  // putar balik menyusuri jalur yang sama
+    private static final float SETTLE_RATE = 14f;   // peredam cadangan (kalau tidak bisa putar balik)
+    private static final long  GRACE_MS    = 400L;
+    private static final long  JUMP_GAP_MS = 60L;
     private static final long  NEW_LEASH_GAP_MS = 34L;
 
     private static final float MIN_SCALE = 0.05f;
@@ -71,10 +75,20 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     // state animasi
     private boolean lastValid, hasOffset;
     private long lastMs = 0, t0 = 0;
-    private float prevTsx, prevTsy, prevTtx, prevTty;   // target dari launcher (frame sebelumnya)
-    private float prevDsx, prevDsy, prevDtx, prevDty;   // yang benar-benar ditampilkan
-    private float oSx, oSy, oTx, oTy;                    // offset peredaman
+    private float prevTsx, prevTsy, prevTtx, prevTty;
+    private float prevDsx, prevDsy, prevDtx, prevDty, prevDprog;
+    private float oSx, oSy, oTx, oTy;
     private Object primaryLeash;
+
+    // putar balik
+    private static final int PN = 64;
+    private final boolean[] pValid = new boolean[PN + 1];
+    private final float[][] pGeo = new float[PN + 1][8];   // sx, sy, tx, ty, cropL, cropT, cropR, cropB
+    private int pCount = 0;
+    private volatile boolean remap = false;
+    private boolean remapClosing;
+    private float remapP0;
+    private volatile Rect remapCrop;
 
     // penghalusan tilt
     private float sDx, sDy, sLean, lastCx;
@@ -85,7 +99,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private Handler mainH;
     private final Runnable restoreRun = this::restoreContent;
 
-    private Handler main() {                       // dibuat belakangan: looper belum ada saat fork Zygote
+    private Handler main() {
         if (mainH == null) mainH = new Handler(Looper.getMainLooper());
         return mainH;
     }
@@ -165,6 +179,14 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         Rect raw = new Rect((Rect) p.args[1]);
         curRaw = raw;
 
+        Rect rc = remapCrop;
+        if (remap && rc != null) {                 // mode putar balik: pakai crop dari jalur
+            Rect d = new Rect(rc);
+            p.args[1] = d;
+            lastDispCrop = d;
+            return;
+        }
+
         if (pendingCropOffset && lastDispCrop != null) {
             offL = lastDispCrop.left - raw.left;
             offT = lastDispCrop.top - raw.top;
@@ -216,14 +238,17 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
         if (fullTarget) {
             // animasi baru yang mulai dari full screen (mis. tutup app) tepat setelah animasi dipotong
-            boolean keep = SMOOTH_INTERRUPT && cont && (prevDsx < 0.97f || !isSettled(now));
+            boolean keep = SMOOTH_INTERRUPT && cont && (remap || prevDsx < 0.97f || !isSettled(now));
             if (!keep) { resetState(); return; }
         }
         if (sx <= MIN_SCALE || sy <= MIN_SCALE) return;
 
         if (!cont || dt >= NEW_LEASH_GAP_MS) primaryLeash = p.args[0];
 
-        // ---- deteksi lompatan (animasi dipotong / diganti) lalu simpan offset kontinuitas ----
+        Rect rawCrop = (raw == null || raw.isEmpty()) ? new Rect(0, 0, (int) w, (int) h) : raw;
+        float tauT = progOf(rawCrop, sx, w);     // progres target dari launcher (1 = full, 0 = ikon)
+
+        // ---- deteksi animasi dipotong / diganti ----
         if (cont) {
             float dScale = Math.abs(sx - prevTsx);
             float pcx = prevTtx + prevTsx * w / 2f, ncx = tx + sx * w / 2f;
@@ -231,45 +256,108 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             float dCen = (float) Math.hypot(ncx - pcx, ncy - pcy) / w;
             boolean jump = SMOOTH_INTERRUPT && (dt >= JUMP_GAP_MS || dScale > 0.12f || dCen > 0.25f);
             if (jump) {
-                oSx = prevDsx - sx;
-                oSy = prevDsy - sy;
-                oTx = prevDtx - tx;
-                oTy = prevDty - ty;
-                t0 = now;
-                hasOffset = true;
-                hasCropOffset = false;
-                pendingCropOffset = true;
-                XposedBridge.log(TAG + "interupsi: tampil sx=" + prevDsx + " -> target sx=" + sx);
+                boolean done = false;
+                float p0 = prevDprog;
+                boolean closingNew = tauT > 0.85f, openingNew = tauT < 0.15f;
+                if (REVERSE_MODE && pCount >= 6 && p0 > 0.03f && p0 < 0.97f && (closingNew || openingNew)) {
+                    boolean okIcon = true;
+                    if (openingNew) {                       // ikon harus sama dengan jalur yang direkam
+                        float[] g0 = tableLookup(0f);
+                        if (g0 == null) {
+                            okIcon = false;
+                        } else {
+                            float gcx = g0[2] + ((g0[4] + g0[6]) / 2f) * g0[0];
+                            float gcy = g0[3] + ((g0[5] + g0[7]) / 2f) * g0[1];
+                            float tcx = tx + rawCrop.exactCenterX() * sx;
+                            float tcy = ty + rawCrop.exactCenterY() * sy;
+                            okIcon = Math.hypot(tcx - gcx, tcy - gcy) / w < 0.2f;
+                        }
+                    }
+                    if (okIcon) {
+                        remap = true;
+                        remapClosing = closingNew;
+                        remapP0 = p0;
+                        hasOffset = false;
+                        hasCropOffset = false;
+                        pendingCropOffset = false;
+                        done = true;
+                        XposedBridge.log(TAG + "putar balik dari p=" + p0 + (closingNew ? " (tutup)" : " (buka)"));
+                    }
+                }
+                if (!done) {
+                    remap = false;
+                    remapCrop = null;
+                    oSx = prevDsx - sx;
+                    oSy = prevDsy - sy;
+                    oTx = prevDtx - tx;
+                    oTy = prevDty - ty;
+                    t0 = now;
+                    hasOffset = true;
+                    hasCropOffset = false;
+                    pendingCropOffset = true;
+                    XposedBridge.log(TAG + "interupsi (peralihan mulus): tampil sx=" + prevDsx + " -> target sx=" + sx);
+                }
             }
         } else {
             hasOffset = false;
             hasCropOffset = false;
             pendingCropOffset = false;
+            remap = false;
+            remapCrop = null;
+            tableClear();
         }
 
-        // ---- nilai yang ditampilkan = target + offset yang meredam ----
-        float f = factor(now);
-        float dsx = Math.max(MIN_SCALE, Math.min(1.5f, sx + oSx * f));
-        float dsy = Math.max(MIN_SCALE, Math.min(1.5f, sy + oSy * f));
-        float dtx = tx + oTx * f;
-        float dty = ty + oTy * f;
+        // ---- geometri yang ditampilkan ----
+        float dsx = sx, dsy = sy, dtx = tx, dty = ty;
+        Rect crop = null;
+        float f = 0f;
+        boolean remapped = false;
 
-        Rect crop = displayedCrop(raw, f, (int) w, (int) h);
+        if (remap) {
+            float pp = remapClosing ? remapP0 * tauT : remapP0 + (1f - remapP0) * tauT;
+            float[] g = tableLookup(pp);
+            if (g != null) {
+                dsx = g[0]; dsy = g[1]; dtx = g[2]; dty = g[3];
+                crop = new Rect(Math.round(g[4]), Math.round(g[5]), Math.round(g[6]), Math.round(g[7]));
+                if (crop.right > crop.left && crop.bottom > crop.top) {
+                    remapCrop = new Rect(crop);
+                    remapped = true;
+                }
+            }
+            boolean ended = remapClosing ? tauT <= 0.01f : tauT >= 0.99f;
+            if (!remapped || ended) {
+                remap = false;
+                remapCrop = null;
+            }
+        }
+        if (!remapped) {
+            f = factor(now);
+            dsx = Math.max(MIN_SCALE, Math.min(1.5f, sx + oSx * f));
+            dsy = Math.max(MIN_SCALE, Math.min(1.5f, sy + oSy * f));
+            dtx = tx + oTx * f;
+            dty = ty + oTy * f;
+            crop = displayedCrop(raw, f, (int) w, (int) h);
+        }
+
         float lcx = crop.exactCenterX(), lcy = crop.exactCenterY();
         float cx = dtx + lcx * dsx;
         float cy = dty + lcy * dsy;
 
-        // progres tunggal: 0 = seukuran ikon, 1 = full screen (sumber sinkron jendela + ikon)
-        float visW = crop.width() * dsx;
-        float progress = clamp01((1f - visW / w) / 0.85f);
+        // progres tunggal dari yang BENAR-BENAR tampil (sumber sinkron jendela + ikon)
+        float progress = progOf(crop, dsx, w);
         float env = smoothstep(progress);
+
+        // rekam jalur hanya dari frame normal (bukan hasil putar balik / peralihan)
+        if (!remapped && !(hasOffset && f > 0.02f)) {
+            tableRecord(progress, dsx, dsy, dtx, dty, crop);
+        }
 
         if (ICON_ANIM) {
             final Activity act = launcherRef.get();
             if (act != null) {
-                final float pp = progress;
+                final float pp2 = progress;
                 final int iw = (int) w, ih = (int) h;
-                runMain(() -> applyContent(act, pp, iw, ih));
+                runMain(() -> applyContent(act, pp2, iw, ih));
             }
         }
 
@@ -297,7 +385,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         float skewY = (SKEW_Y_X * sDx) * env;
 
         Matrix out;
-        if (hasOffset && f > 0.002f) {
+        if (remapped || (hasOffset && f > 0.002f)) {
             out = new Matrix();
             out.setScale(dsx, dsy);
             out.postTranslate(dtx, dty);
@@ -309,11 +397,50 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         p.args[1] = out;
 
         prevTsx = sx; prevTsy = sy; prevTtx = tx; prevTty = ty;
-        prevDsx = dsx; prevDsy = dsy; prevDtx = dtx; prevDty = dty;
+        prevDsx = dsx; prevDsy = dsy; prevDtx = dtx; prevDty = dty; prevDprog = progress;
         lastValid = true;
         lastMs = now;
     }
 
+    // ---------- jalur gerak (progres -> geometri) ----------
+    private static float progOf(Rect crop, float sx, float w) {
+        return clamp01((1f - crop.width() * sx / w) / 0.85f);
+    }
+
+    private void tableClear() {
+        Arrays.fill(pValid, false);
+        pCount = 0;
+    }
+
+    private void tableRecord(float prog, float sx, float sy, float tx, float ty, Rect c) {
+        int b = Math.round(clamp01(prog) * PN);
+        if (!pValid[b]) { pValid[b] = true; pCount++; }
+        float[] g = pGeo[b];
+        g[0] = sx; g[1] = sy; g[2] = tx; g[3] = ty;
+        g[4] = c.left; g[5] = c.top; g[6] = c.right; g[7] = c.bottom;
+    }
+
+    private float[] tableLookup(float pp) {
+        float x = clamp01(pp) * PN;
+        int b0 = (int) Math.floor(x);
+        int b1 = Math.min(PN, b0 + 1);
+        int lo = b0, hi = b1;
+        while (lo >= 0 && !pValid[lo] && b0 - lo < 4) lo--;
+        while (hi <= PN && !pValid[hi] && hi - b1 < 4) hi++;
+        boolean okLo = lo >= 0 && pValid[lo];
+        boolean okHi = hi <= PN && pValid[hi];
+        if (!okLo && !okHi) return null;
+        float[] out = new float[8];
+        if (okLo && okHi) {
+            float t = (hi == lo) ? 0f : clamp01((x - lo) / (hi - lo));
+            for (int i = 0; i < 8; i++) out[i] = pGeo[lo][i] + (pGeo[hi][i] - pGeo[lo][i]) * t;
+        } else {
+            System.arraycopy(pGeo[okLo ? lo : hi], 0, out, 0, 8);
+        }
+        return out;
+    }
+
+    // ---------- peralihan mulus cadangan ----------
     private Rect displayedCrop(Rect raw, float f, int w, int h) {
         Rect base = (raw == null || raw.isEmpty()) ? new Rect(0, 0, w, h) : new Rect(raw);
         if (hasCropOffset) {
@@ -349,6 +476,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         hasOffset = false;
         hasCropOffset = false;
         pendingCropOffset = false;
+        remap = false;
+        remapCrop = null;
         primaryLeash = null;
         curRaw = null;
         lastDispCrop = null;
@@ -361,7 +490,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             Object r = XposedHelpers.callMethod(a, "isSameSurface", b);
             return !(r instanceof Boolean) || (Boolean) r;
         } catch (Throwable t) {
-            return true;   // tidak bisa dibedakan -> anggap sama
+            return true;
         }
     }
 
