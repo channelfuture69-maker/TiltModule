@@ -54,7 +54,11 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private static final float SCALE_RANGE = 0.85f;
     private static final long  NEW_ANIM_GAP = 250L;
 
-    private final Handler main = new Handler(Looper.getMainLooper());
+    private Handler mainH;
+    private Handler main() {
+        if (mainH == null) mainH = new Handler(Looper.getMainLooper());
+        return mainH;
+    }
     private volatile WeakReference<Activity> launcherRef = new WeakReference<>(null);
 
     // state animasi (diakses dari thread hook)
@@ -194,8 +198,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             overlay.setRotationX(rx);
             overlay.setRotationY(ry);
 
-            main.removeCallbacks(removeRun);
-            main.postDelayed(removeRun, HIDE_DELAY);
+            main().removeCallbacks(removeRun);
+            main().postDelayed(removeRun, HIDE_DELAY);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "overlay: " + t);
         }
@@ -203,7 +207,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     private void removeOverlay() {
         try {
-            main.removeCallbacks(removeRun);
+            main().removeCallbacks(removeRun);
             if (overlay != null) {
                 ViewGroup parent = (ViewGroup) overlay.getParent();
                 if (parent != null) parent.removeView(overlay);
@@ -234,7 +238,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     private void runMain(Runnable r) {
         if (Looper.myLooper() == Looper.getMainLooper()) r.run();
-        else main.post(r);
+        else main().post(r);
     }
 
     private static float clamp(float f) {
