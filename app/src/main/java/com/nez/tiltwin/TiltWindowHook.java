@@ -3,13 +3,20 @@ package com.nez.tiltwin;
 import android.animation.AnimatorSet;
 import android.app.Activity;
 import android.content.res.Resources;
+import android.graphics.Bitmap;
 import android.graphics.Matrix;
+import android.graphics.Outline;
 import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Pair;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewOutlineProvider;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
+import android.widget.Toast;
 
 import java.lang.ref.WeakReference;
 import java.util.Arrays;
@@ -30,7 +37,9 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *    jadi gerakan, tilt, dan animasi ikon-nya identik dengan animasi normal, tanpa lompat.
  *  - Kalau tidak bisa dibalik (mis. ikon lain), dipakai peralihan mulus (offset teredam).
  *
- * Batasan: matrix SurfaceControl cuma 2D, jadi tilt jendela = rotasi + skew, bukan perspektif 3D asli.
+ * Mode PERSPEKTIF (trapesium seperti iOS): snapshot jendela app diambil lalu digambar sebagai overlay
+ * 3D (rotationX/Y + cameraDistance) di window launcher, jendela asli disembunyikan sementara.
+ * Kalau snapshot gagal diambil, otomatis jatuh balik ke tilt 2D (rotasi + skew) dan muncul Toast alasannya.
  */
 public class TiltWindowHook implements IXposedHookLoadPackage {
 
@@ -51,6 +60,15 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private static final float ICON_ZOOM   = 0.14f;
     private static final float FADE_END    = 0.55f;
     private static final long  RESTORE_MS  = 300L;
+
+    // ===== Perspektif 3D (trapesium) =====
+    private static final boolean PERSPECTIVE = true;   // false = selalu pakai tilt 2D
+    private static final float RX_BASE   = 14f;   // atas menyempit/melebar (balik tanda kalau kebalik)
+    private static final float RX_BY_Y   = 4f;    // ikon bawah lebih miring, atas lebih landai
+    private static final float RY_BY_X   = -12f;  // miring kiri-kanan menurut posisi ikon
+    private static final float RY_CENTER = 0f;
+    private static final float CAMERA_DIST = 2500f; // makin kecil = perspektif makin kuat
+    private static final float CORNER_SCREEN_PX = 56f;
 
     // ===== Saat animasi dipotong =====
     private static final boolean SMOOTH_INTERRUPT = true;  // false = matikan semua penanganan potong
@@ -92,6 +110,17 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     // penghalusan tilt
     private float sDx, sDy, sLean, lastCx;
+
+    // perspektif
+    private Bitmap snap;
+    private boolean snapRetaken, animOpening, perspOff, toastShown;
+    private int perspFails = 0;
+    private String lastCaptureErr = "?";
+    private ImageView overlay;                 // main thread
+    private volatile boolean overlayReady = false;
+    private Rect outlineRect;
+    private float outlineRadius;
+    private final Runnable overlayRemoveRun = this::removeOverlay;
 
     // konten home (main thread)
     private static class Saved { View v; float alpha, sx, sy; }
@@ -249,6 +278,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         float tauT = progOf(rawCrop, sx, w);     // progres target dari launcher (1 = full, 0 = ikon)
 
         // ---- deteksi animasi dipotong / diganti ----
+        boolean jumped = false;
         if (cont) {
             float dScale = Math.abs(sx - prevTsx);
             float pcx = prevTtx + prevTsx * w / 2f, ncx = tx + sx * w / 2f;
@@ -256,6 +286,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             float dCen = (float) Math.hypot(ncx - pcx, ncy - pcy) / w;
             boolean jump = SMOOTH_INTERRUPT && (dt >= JUMP_GAP_MS || dScale > 0.12f || dCen > 0.25f);
             if (jump) {
+                jumped = true;
                 boolean done = false;
                 float p0 = prevDprog;
                 boolean closingNew = tauT > 0.85f, openingNew = tauT < 0.15f;
@@ -379,6 +410,50 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             lastCx = cx;
         }
 
+        // ---- mode perspektif 3D: snapshot + overlay ----
+        if (PERSPECTIVE && !perspOff) {
+            final Activity actP = launcherRef.get();
+            if (actP != null) {
+                boolean newAnimFrame = !cont || (jumped && !remap);
+                if (newAnimFrame) {
+                    snap = capture(p.args[0]);
+                    snapRetaken = false;
+                    animOpening = progress < 0.5f;
+                    if (snap == null) {
+                        perspFails++;
+                        reportOnce(actP, lastCaptureErr);
+                        if (perspFails >= 3) { perspOff = true; XposedBridge.log(TAG + "perspektif dimatikan, pakai tilt 2D"); }
+                    } else {
+                        perspFails = 0;
+                    }
+                } else if (snap != null && !snapRetaken && animOpening && progress > 0.4f) {
+                    snapRetaken = true;
+                    Bitmap b2 = capture(p.args[0]);
+                    if (b2 != null) snap = b2;
+                }
+                final Bitmap sb = snap;
+                if (sb != null) {
+                    final float rx = (RX_BASE + RX_BY_Y * sDy) * env;
+                    final float ry = (RY_BY_X * sDx + RY_CENTER * (1f - Math.abs(sDx))) * env;
+                    final float fdsx = dsx, fdsy = dsy, fdtx = dtx, fdty = dty, flcx = lcx, flcy = lcy;
+                    final Rect fcrop = new Rect(crop);
+                    final int iw = (int) w, ih = (int) h;
+                    final float dens = dm.density;
+                    runMain(() -> updateOverlay(actP, sb, iw, ih, flcx, flcy, fdtx, fdty, fdsx, fdsy, rx, ry, dens, fcrop));
+                    if (overlayReady) {
+                        Matrix off = new Matrix();
+                        off.setTranslate(-10000f, -10000f);   // jendela asli disembunyikan
+                        p.args[1] = off;
+                        prevTsx = sx; prevTsy = sy; prevTtx = tx; prevTty = ty;
+                        prevDsx = dsx; prevDsy = dsy; prevDtx = dtx; prevDty = dty; prevDprog = progress;
+                        lastValid = true;
+                        lastMs = now;
+                        return;
+                    }
+                }
+            }
+        }
+
         float wc = (1f - Math.abs(sDx)) * (1f - Math.abs(sDy));
         float rot   = (ROT_DEG_X * sDx + CENTER_ROT * wc) * env;
         float skewX = (SKEW_X_Y * sDy + CENTER_SKEW * wc + LEAN_GAIN * sLean) * env;
@@ -481,6 +556,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         primaryLeash = null;
         curRaw = null;
         lastDispCrop = null;
+        snap = null;
+        if (overlay != null) runMain(this::removeOverlay);
     }
 
     private static boolean sameLeash(Object a, Object b) {
@@ -491,6 +568,102 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             return !(r instanceof Boolean) || (Boolean) r;
         } catch (Throwable t) {
             return true;
+        }
+    }
+
+    // ---------- snapshot + overlay perspektif ----------
+    private Bitmap capture(Object leash) {
+        try {
+            Class<?> sc = XposedHelpers.findClass("android.window.ScreenCapture", null);
+            Class<?> bld = XposedHelpers.findClass("android.window.ScreenCapture$LayerCaptureArgs$Builder", null);
+            Object builder = XposedHelpers.newInstance(bld, leash);
+            Object args = XposedHelpers.callMethod(builder, "build");
+            Object buf = XposedHelpers.callStaticMethod(sc, "captureLayers", args);
+            if (buf == null) { lastCaptureErr = "captureLayers null"; return null; }
+            Bitmap bm = (Bitmap) XposedHelpers.callMethod(buf, "asBitmap");
+            if (bm == null) { lastCaptureErr = "asBitmap null"; return null; }
+            return bm;
+        } catch (Throwable t) {
+            Throwable c = t.getCause() != null ? t.getCause() : t;
+            String m = c.getClass().getSimpleName() + ": " + c.getMessage();
+            lastCaptureErr = m.length() > 90 ? m.substring(0, 90) : m;
+            XposedBridge.log(TAG + "capture: " + t);
+            return null;
+        }
+    }
+
+    private void reportOnce(final Activity act, final String msg) {
+        XposedBridge.log(TAG + "snapshot gagal: " + msg);
+        if (toastShown) return;
+        toastShown = true;
+        runMain(() -> {
+            try {
+                Toast.makeText(act.getApplicationContext(), "TiltWindow snapshot gagal: " + msg,
+                        Toast.LENGTH_LONG).show();
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    private void updateOverlay(Activity act, Bitmap b, int w, int h, float lcx, float lcy,
+                               float tx, float ty, float sx, float sy, float rx, float ry,
+                               float density, Rect crop) {
+        try {
+            if (overlay == null) {
+                ImageView iv = new ImageView(act);
+                iv.setScaleType(ImageView.ScaleType.FIT_XY);
+                iv.setClipToOutline(true);
+                iv.setOutlineProvider(new ViewOutlineProvider() {
+                    @Override
+                    public void getOutline(View view, Outline o) {
+                        Rect r = outlineRect;
+                        if (r == null) r = new Rect(0, 0, view.getWidth(), view.getHeight());
+                        o.setRoundRect(r, outlineRadius);
+                    }
+                });
+                iv.setCameraDistance(CAMERA_DIST * density);
+                ViewGroup decor = (ViewGroup) act.getWindow().getDecorView();
+                decor.addView(iv, new FrameLayout.LayoutParams(w, h));
+                overlay = iv;
+            }
+            if (overlay.getTag() != b) {
+                overlay.setImageBitmap(b);
+                overlay.setTag(b);
+            }
+            overlay.setPivotX(lcx);
+            overlay.setPivotY(lcy);
+            overlay.setTranslationX(tx + lcx * (sx - 1f));
+            overlay.setTranslationY(ty + lcy * (sy - 1f));
+            overlay.setScaleX(sx);
+            overlay.setScaleY(sy);
+            overlay.setRotationX(rx);
+            overlay.setRotationY(ry);
+            outlineRadius = Math.min(Math.min(crop.width(), crop.height()) / 2f, CORNER_SCREEN_PX / Math.max(sx, 0.05f));
+            outlineRect = crop;
+            overlay.invalidateOutline();
+            overlayReady = true;
+
+            main().removeCallbacks(overlayRemoveRun);
+            main().postDelayed(overlayRemoveRun, 120L);
+        } catch (Throwable t) {
+            overlayReady = false;
+            perspFails++;
+            XposedBridge.log(TAG + "overlay: " + t);
+            if (perspFails >= 2) { perspOff = true; XposedBridge.log(TAG + "perspektif dimatikan, pakai tilt 2D"); }
+        }
+    }
+
+    private void removeOverlay() {
+        try {
+            main().removeCallbacks(overlayRemoveRun);
+            overlayReady = false;
+            if (overlay != null) {
+                ViewGroup parent = (ViewGroup) overlay.getParent();
+                if (parent != null) parent.removeView(overlay);
+                overlay = null;
+            }
+            outlineRect = null;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + "remove overlay: " + t);
         }
     }
 
