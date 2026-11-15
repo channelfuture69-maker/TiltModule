@@ -68,7 +68,9 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private static final float RY_BY_X   = -12f;  // miring kiri-kanan menurut posisi ikon
     private static final float RY_CENTER = 0f;
     private static final float CAMERA_DIST = 2500f; // makin kecil = perspektif makin kuat
-    private static final float CORNER_SCREEN_PX = 56f;
+    private static final float CORNER_LOCAL = 90f;      // radius sudut jendela (px, ikut mengecil bersama jendela)
+    private static final float WIN_ALPHA_MIN = 0.2f;    // jendela hampir transparan saat seukuran ikon (crossfade dengan ikon)
+    private static final float WIN_FADE_IN = 0.2f;      // jendela penuh opak setelah progres ini
 
     // ===== Saat animasi dipotong =====
     private static final boolean SMOOTH_INTERRUPT = true;  // false = matikan semua penanganan potong
@@ -118,8 +120,6 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private String lastCaptureErr = "?";
     private ImageView overlay;                 // main thread
     private volatile boolean overlayReady = false;
-    private Rect outlineRect;
-    private float outlineRadius;
     private final Runnable overlayRemoveRun = this::removeOverlay;
 
     // konten home (main thread)
@@ -376,7 +376,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
         // progres tunggal dari yang BENAR-BENAR tampil (sumber sinkron jendela + ikon)
         float progress = progOf(crop, dsx, w);
-        float env = smoothstep(progress);
+        float env = smoothstep(1f - progress);   // tilt kuat saat kecil, hilang saat full
 
         // rekam jalur hanya dari frame normal (bukan hasil putar balik / peralihan)
         if (!remapped && !(hasOffset && f > 0.02f)) {
@@ -435,11 +435,13 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 if (sb != null) {
                     final float rx = (RX_BASE + RX_BY_Y * sDy) * env;
                     final float ry = (RY_BY_X * sDx + RY_CENTER * (1f - Math.abs(sDx))) * env;
-                    final float fdsx = dsx, fdsy = dsy, fdtx = dtx, fdty = dty, flcx = lcx, flcy = lcy;
-                    final Rect fcrop = new Rect(crop);
+                    // iOS: jendela tetap berbentuk layar penuh (rasio dipertahankan), mengecil seragam ke ikon
+                    final float fS = Math.max(0.04f, Math.min(1.05f, crop.width() * dsx / w));
+                    final float fA = WIN_ALPHA_MIN + (1f - WIN_ALPHA_MIN) * smoothstep(clamp01(progress / WIN_FADE_IN));
+                    final float fcx = cx, fcy = cy;
                     final int iw = (int) w, ih = (int) h;
                     final float dens = dm.density;
-                    runMain(() -> updateOverlay(actP, sb, iw, ih, flcx, flcy, fdtx, fdty, fdsx, fdsy, rx, ry, dens, fcrop));
+                    runMain(() -> updateOverlay(actP, sb, iw, ih, fcx, fcy, fS, fA, rx, ry, dens));
                     if (overlayReady) {
                         Matrix off = new Matrix();
                         off.setTranslate(-10000f, -10000f);   // jendela asli disembunyikan
@@ -479,7 +481,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
     // ---------- jalur gerak (progres -> geometri) ----------
     private static float progOf(Rect crop, float sx, float w) {
-        return clamp01((1f - crop.width() * sx / w) / 0.85f);
+        return clamp01((crop.width() * sx / w - 0.15f) / 0.85f);   // 0 = seukuran ikon, 1 = full screen
     }
 
     private void tableClear() {
@@ -604,9 +606,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         });
     }
 
-    private void updateOverlay(Activity act, Bitmap b, int w, int h, float lcx, float lcy,
-                               float tx, float ty, float sx, float sy, float rx, float ry,
-                               float density, Rect crop) {
+    private void updateOverlay(Activity act, Bitmap b, int w, int h, float cx, float cy,
+                               float scale, float alpha, float rx, float ry, float density) {
         try {
             if (overlay == null) {
                 ImageView iv = new ImageView(act);
@@ -615,12 +616,12 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 iv.setOutlineProvider(new ViewOutlineProvider() {
                     @Override
                     public void getOutline(View view, Outline o) {
-                        Rect r = outlineRect;
-                        if (r == null) r = new Rect(0, 0, view.getWidth(), view.getHeight());
-                        o.setRoundRect(r, outlineRadius);
+                        o.setRoundRect(0, 0, view.getWidth(), view.getHeight(), CORNER_LOCAL);
                     }
                 });
                 iv.setCameraDistance(CAMERA_DIST * density);
+                iv.setPivotX(w / 2f);
+                iv.setPivotY(h / 2f);
                 ViewGroup decor = (ViewGroup) act.getWindow().getDecorView();
                 decor.addView(iv, new FrameLayout.LayoutParams(w, h));
                 overlay = iv;
@@ -629,17 +630,13 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 overlay.setImageBitmap(b);
                 overlay.setTag(b);
             }
-            overlay.setPivotX(lcx);
-            overlay.setPivotY(lcy);
-            overlay.setTranslationX(tx + lcx * (sx - 1f));
-            overlay.setTranslationY(ty + lcy * (sy - 1f));
-            overlay.setScaleX(sx);
-            overlay.setScaleY(sy);
+            overlay.setTranslationX(cx - w / 2f);   // pusat jendela mendarat di pusat area yang kelihatan
+            overlay.setTranslationY(cy - h / 2f);
+            overlay.setScaleX(scale);
+            overlay.setScaleY(scale);
+            overlay.setAlpha(alpha);
             overlay.setRotationX(rx);
             overlay.setRotationY(ry);
-            outlineRadius = Math.min(Math.min(crop.width(), crop.height()) / 2f, CORNER_SCREEN_PX / Math.max(sx, 0.05f));
-            outlineRect = crop;
-            overlay.invalidateOutline();
             overlayReady = true;
 
             main().removeCallbacks(overlayRemoveRun);
@@ -661,7 +658,6 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 if (parent != null) parent.removeView(overlay);
                 overlay = null;
             }
-            outlineRect = null;
         } catch (Throwable t) {
             XposedBridge.log(TAG + "remove overlay: " + t);
         }
