@@ -5,6 +5,7 @@ import android.content.res.Resources;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
 import android.graphics.Outline;
+import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
@@ -23,35 +24,30 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * Tilt perspektif (trapesium) seperti contoh video.
+ * Tilt perspektif (trapesium) untuk animasi buka/tutup app di launcher.
  *
- * Matrix SurfaceControl cuma 2D, jadi perspektif nggak bisa dibuat langsung di jendela app.
- * Cara yang dipakai:
- *  1. Hook SurfaceControl.Transaction.setMatrix di proses launcher (dipanggil tiap frame animasi).
- *  2. Di frame pertama, ambil snapshot leash jendela app (ScreenCapture.captureLayers).
- *  3. Jendela asli disembunyikan (digeser ke luar layar), diganti ImageView snapshot yang
- *     ditaruh di window launcher dan diberi rotationX/rotationY + cameraDistance (3D asli).
- *  4. Arah miring mengikuti posisi ikon (kanan/kiri/tengah/bawah beda).
+ * Launcher menganimasikan jendela app dengan 2 hal: matrix (scale+translate) DAN crop
+ * (area jendela yang kelihatan, mengecil jadi bentuk ikon). Versi sebelumnya cuma
+ * membaca matrix, jadi posisi/bentuknya melenceng. Versi ini juga membaca setWindowCrop.
  *
- * Catatan: snapshot di-ambil ulang sekali di tengah animasi supaya isinya tidak kosong,
- * jadi isi jendela tidak 100% live. API hidden bisa beda antar versi Android/XOS.
+ * Cara: snapshot leash jendela -> jendela asli disembunyikan -> ImageView snapshot di window
+ * launcher diberi crop yang sama + rotationX/Y + cameraDistance (perspektif asli).
  */
 public class TiltWindowHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "[TiltWindow] ";
 
     // ===== Atur di sini =====
-    private static final float RX_BASE   = 16f;    // miring atas-bawah (atas menjauh). Balik tanda kalau arahnya kebalik
-    private static final float RX_BY_Y   = 4f;     // tambahan: ikon bawah lebih miring, atas lebih landai
-    private static final float RY_BY_X   = -14f;   // miring kiri-kanan mengikuti posisi ikon (kanan/kiri beda arah)
+    private static final float RX_BASE   = 16f;    // miring atas-bawah (atas menjauh). Balik tanda kalau kebalik
+    private static final float RX_BY_Y   = 4f;     // ikon bawah lebih miring, atas lebih landai
+    private static final float RY_BY_X   = -14f;   // miring kiri-kanan menurut posisi ikon
     private static final float RY_CENTER = 0f;     // miring kiri-kanan untuk ikon tepat di tengah
     private static final float CAMERA_DIST = 2500f;// makin kecil = perspektif makin kuat (dikali density)
-    private static final float AMP = 1.8f;         // penguat posisi ikon (pinggir -> miring penuh)
-    private static final float CORNER_PX = 56f;    // radius sudut jendela
-    private static final long  HIDE_DELAY = 90L;   // ms setelah frame terakhir, overlay dihapus
+    private static final float AMP = 1.8f;         // penguat posisi ikon
+    private static final float CORNER_SCREEN_PX = 56f; // radius sudut di layar
+    private static final long  HIDE_DELAY = 90L;
 
     private static final float MIN_SCALE = 0.05f;
-    private static final float SCALE_RANGE = 0.85f;
     private static final long  NEW_ANIM_GAP = 250L;
 
     private Handler mainH;
@@ -59,15 +55,19 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         if (mainH == null) mainH = new Handler(Looper.getMainLooper());
         return mainH;
     }
+
     private volatile WeakReference<Activity> launcherRef = new WeakReference<>(null);
 
-    // state animasi (diakses dari thread hook)
+    // state animasi (thread hook)
     private volatile Bitmap bmp;
+    private volatile Rect curCrop;
     private volatile long lastFrame = 0;
     private volatile boolean recaptured = false;
     private volatile boolean loggedFail = false;
     // state view (main thread)
     private ImageView overlay;
+    private volatile Rect outlineRect = null;
+    private volatile float outlineRadius = 0f;
 
     private final Runnable removeRun = this::removeOverlay;
 
@@ -78,7 +78,6 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
         XposedBridge.log(TAG + "loaded in " + lpp.packageName);
 
-        // simpan activity launcher untuk tempat menaruh overlay
         try {
             XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
                 @Override
@@ -95,17 +94,27 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
 
         try {
             Class<?> tx = XposedHelpers.findClass("android.view.SurfaceControl$Transaction", lpp.classLoader);
+
             XposedBridge.hookAllMethods(tx, "setMatrix", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam p) {
-                    try {
-                        onSetMatrix(p);
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + t);
-                    }
+                    try { onSetMatrix(p); } catch (Throwable t) { XposedBridge.log(TAG + t); }
                 }
             });
-            XposedBridge.log(TAG + "hooked SurfaceControl.Transaction.setMatrix");
+
+            XposedBridge.hookAllMethods(tx, "setWindowCrop", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    try {
+                        if (p.args.length == 2 && p.args[1] instanceof Rect) {
+                            Rect c = new Rect((Rect) p.args[1]);
+                            curCrop = c;
+                            if (overlay != null) runMain(() -> applyOutline(c));
+                        }
+                    } catch (Throwable t) { XposedBridge.log(TAG + t); }
+                }
+            });
+            XposedBridge.log(TAG + "hooked setMatrix + setWindowCrop");
         } catch (Throwable t) {
             XposedBridge.log(TAG + "gagal hook: " + t);
         }
@@ -119,8 +128,17 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         src.getValues(v);
         float sx = v[Matrix.MSCALE_X];
         float sy = v[Matrix.MSCALE_Y];
+        float tx = v[Matrix.MTRANS_X];
+        float ty = v[Matrix.MTRANS_Y];
 
-        if (sx >= 0.995f) {                       // frame akhir / normal: bersihkan overlay
+        DisplayMetrics dm = Resources.getSystem().getDisplayMetrics();
+        final int w = dm.widthPixels, h = dm.heightPixels;
+
+        Rect crop = curCrop;
+        boolean cropped = crop != null && !crop.isEmpty()
+                && (crop.width() < w * 0.98f || crop.height() < h * 0.98f);
+
+        if (sx >= 0.995f && !cropped) {            // normal / frame akhir
             if (overlay != null) runMain(this::removeOverlay);
             return;
         }
@@ -132,12 +150,18 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         long now = System.currentTimeMillis();
         boolean newAnim = now - lastFrame > NEW_ANIM_GAP;
         lastFrame = now;
-        float progress = Math.min(1f, (1f - sx) / SCALE_RANGE);
+
+        if (crop == null || crop.isEmpty()) crop = new Rect(0, 0, w, h);
+
+        float visW = crop.width() * sx;
+        float progress = Math.max(0f, Math.min(1f, (1f - visW / w) / 0.85f));
 
         if (newAnim) {
             recaptured = false;
             bmp = capture(p.args[0]);
-        } else if (!recaptured && progress < 0.4f) {   // sudah mulai membesar -> ambil ulang sekali
+            XposedBridge.log(TAG + "anim mulai sx=" + sx + " crop=" + crop
+                    + " bmp=" + (bmp == null ? "null" : bmp.getWidth() + "x" + bmp.getHeight()));
+        } else if (!recaptured && progress < 0.5f) {
             recaptured = true;
             Bitmap b2 = capture(p.args[0]);
             if (b2 != null) bmp = b2;
@@ -148,29 +172,31 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             return;
         }
 
-        DisplayMetrics dm = Resources.getSystem().getDisplayMetrics();
-        final int w = dm.widthPixels, h = dm.heightPixels;
-        final float cx = v[Matrix.MTRANS_X] + w * sx / 2f;
-        final float cy = v[Matrix.MTRANS_Y] + h * sy / 2f;
+        // pusat area yang kelihatan (koordinat lokal jendela) dan posisinya di layar
+        final float lcx = crop.exactCenterX(), lcy = crop.exactCenterY();
+        final float cx = tx + lcx * sx;
+        final float cy = ty + lcy * sy;
 
         float dx = clamp((cx - w / 2f) / (w / 2f) * AMP);
         float dy = clamp((cy - h / 2f) / (h / 2f) * AMP);
         final float rx = (RX_BASE + RX_BY_Y * dy) * progress;
         final float ry = (RY_BY_X * dx + RY_CENTER * (1f - Math.abs(dx))) * progress;
-        final float fsx = sx, fsy = sy;
+
+        final float fsx = sx, fsy = sy, ftx = tx, fty = ty;
         final float density = dm.density;
+        final Rect fcrop = new Rect(crop);
 
-        runMain(() -> updateOverlay(act, b, w, h, cx, cy, fsx, fsy, rx, ry, density));
+        runMain(() -> updateOverlay(act, b, w, h, lcx, lcy, ftx, fty, fsx, fsy, rx, ry, density, fcrop));
 
-        // sembunyikan jendela asli: geser jauh ke luar layar
         Matrix off = new Matrix();
         off.setTranslate(-10000f, -10000f);
         p.args[1] = off;
     }
 
     // ---------- overlay (main thread) ----------
-    private void updateOverlay(Activity act, Bitmap b, int w, int h, float cx, float cy,
-                               float sx, float sy, float rx, float ry, float density) {
+    private void updateOverlay(Activity act, Bitmap b, int w, int h, float lcx, float lcy,
+                               float tx, float ty, float sx, float sy, float rx, float ry,
+                               float density, Rect crop) {
         try {
             if (overlay == null) {
                 ImageView iv = new ImageView(act);
@@ -179,7 +205,9 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 iv.setOutlineProvider(new ViewOutlineProvider() {
                     @Override
                     public void getOutline(View view, Outline o) {
-                        o.setRoundRect(0, 0, view.getWidth(), view.getHeight(), CORNER_PX);
+                        Rect r = outlineRect;
+                        if (r == null) r = new Rect(0, 0, view.getWidth(), view.getHeight());
+                        o.setRoundRect(r, outlineRadius);
                     }
                 });
                 iv.setCameraDistance(CAMERA_DIST * density);
@@ -191,18 +219,29 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 overlay.setImageBitmap(b);
                 overlay.setTag(b);
             }
-            overlay.setTranslationX(cx - w / 2f);
-            overlay.setTranslationY(cy - h / 2f);
+            overlay.setPivotX(lcx);
+            overlay.setPivotY(lcy);
+            // titik lokal (lcx,lcy) harus mendarat di tx + lcx*sx
+            overlay.setTranslationX(tx + lcx * (sx - 1f));
+            overlay.setTranslationY(ty + lcy * (sy - 1f));
             overlay.setScaleX(sx);
             overlay.setScaleY(sy);
             overlay.setRotationX(rx);
             overlay.setRotationY(ry);
+
+            outlineRadius = Math.min(Math.min(crop.width(), crop.height()) / 2f, CORNER_SCREEN_PX / sx);
+            applyOutline(crop);
 
             main().removeCallbacks(removeRun);
             main().postDelayed(removeRun, HIDE_DELAY);
         } catch (Throwable t) {
             XposedBridge.log(TAG + "overlay: " + t);
         }
+    }
+
+    private void applyOutline(Rect c) {
+        outlineRect = c;
+        if (overlay != null) overlay.invalidateOutline();
     }
 
     private void removeOverlay() {
@@ -214,6 +253,8 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
                 overlay = null;
             }
             bmp = null;
+            curCrop = null;
+            outlineRect = null;
             lastFrame = 0;
         } catch (Throwable t) {
             XposedBridge.log(TAG + "remove: " + t);
