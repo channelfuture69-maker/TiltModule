@@ -67,6 +67,7 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
     private static final float RX_BY_Y   = 4f;    // ikon bawah lebih miring, atas lebih landai
     private static final float RY_BY_X   = -12f;  // miring kiri-kanan menurut posisi ikon
     private static final float RY_CENTER = 0f;
+    private static final float CAPTURE_SCALE = 0.75f;  // resolusi snapshot (kecil = capture lebih cepat, sedikit lebih buram)
     private static final float CAMERA_DIST = 1300f; // makin kecil = perspektif makin kuat
     private static final float CORNER_SMALL = 90f;      // radius sudut saat kecil (px lokal)
     private static final float CORNER_FULL  = 58f;      // radius sudut saat hampir full (samakan dgn sudut layar)
@@ -593,12 +594,15 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
         try {
             Class<?> sc = XposedHelpers.findClass("android.window.ScreenCapture", null);
             Class<?> bld = XposedHelpers.findClass("android.window.ScreenCapture$LayerCaptureArgs$Builder", null);
+            long t0c = System.nanoTime();
             Object builder = XposedHelpers.newInstance(bld, leash);
+            try { XposedHelpers.callMethod(builder, "setFrameScale", CAPTURE_SCALE); } catch (Throwable ignored) { }
             Object args = XposedHelpers.callMethod(builder, "build");
             Object buf = XposedHelpers.callStaticMethod(sc, "captureLayers", args);
             if (buf == null) { lastCaptureErr = "captureLayers null"; return null; }
             Bitmap bm = (Bitmap) XposedHelpers.callMethod(buf, "asBitmap");
             if (bm == null) { lastCaptureErr = "asBitmap null"; return null; }
+            XposedBridge.log(TAG + "capture " + ((System.nanoTime() - t0c) / 1_000_000L) + "ms " + bm.getWidth() + "x" + bm.getHeight());
             return bm;
         } catch (Throwable t) {
             Throwable c = t.getCause() != null ? t.getCause() : t;
@@ -693,9 +697,10 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             float zoom = 1f + ICON_ZOOM * easeOut(p);
             for (Saved s : saved) {
                 if (s == null) continue;
-                s.v.setAlpha(s.alpha * (1f - fade));
-                s.v.setScaleX(s.sx * zoom);
-                s.v.setScaleY(s.sy * zoom);
+                s.v.setVisibility(View.VISIBLE);
+                s.v.setAlpha(1f - fade);
+                s.v.setScaleX(zoom);
+                s.v.setScaleY(zoom);
             }
             main().removeCallbacks(restoreRun);
             main().postDelayed(restoreRun, RESTORE_MS);
@@ -728,9 +733,9 @@ public class TiltWindowHook implements IXposedHookLoadPackage {
             if (saved != null) {
                 for (Saved s : saved) {
                     if (s == null) continue;
-                    s.v.setAlpha(s.alpha);
-                    s.v.setScaleX(s.sx);
-                    s.v.setScaleY(s.sy);
+                    s.v.setAlpha(1f);
+                    s.v.setScaleX(1f);
+                    s.v.setScaleY(1f);
                     s.v.resetPivot();
                 }
                 saved = null;
